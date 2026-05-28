@@ -10,7 +10,15 @@ import os
 
 
 class TextDataset(Dataset):
-    def __init__(self, prompt_path, extended_prompt_path=None):
+    def __init__(
+        self,
+        prompt_path,
+        extended_prompt_path=None,
+        gt_video_root=None,
+        gt_mask_root=None,
+        gt_video_ext=".pt",
+        gt_mask_ext=".pt",
+    ):
         with open(prompt_path, encoding="utf-8") as f:
             self.prompt_list = [line.rstrip() for line in f]
 
@@ -20,6 +28,10 @@ class TextDataset(Dataset):
             assert len(self.extended_prompt_list) == len(self.prompt_list)
         else:
             self.extended_prompt_list = None
+        self.gt_video_root = Path(gt_video_root) if gt_video_root is not None else None
+        self.gt_mask_root = Path(gt_mask_root) if gt_mask_root is not None else None
+        self.gt_video_ext = gt_video_ext
+        self.gt_mask_ext = gt_mask_ext
 
     def __len__(self):
         return len(self.prompt_list)
@@ -29,6 +41,10 @@ class TextDataset(Dataset):
             "prompts": self.prompt_list[idx],
             "idx": idx,
         }
+        if self.gt_video_root is not None:
+            batch["gt_video_path"] = str(self.gt_video_root / f"{idx}{self.gt_video_ext}")
+        if self.gt_mask_root is not None:
+            batch["gt_mask_path"] = str(self.gt_mask_root / f"{idx}{self.gt_mask_ext}")
         if self.extended_prompt_list is not None:
             batch["extended_prompts"] = self.extended_prompt_list[idx]
         return batch

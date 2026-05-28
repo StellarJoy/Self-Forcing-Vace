@@ -26,11 +26,16 @@ class BaseModel(nn.Module):
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+        self.use_vace_teacher = getattr(args, "use_vace_teacher", False)
 
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name,
+            use_vace=self.use_vace_teacher,
+            is_causal=False
+        )
         self.real_score.model.requires_grad_(False)
 
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
