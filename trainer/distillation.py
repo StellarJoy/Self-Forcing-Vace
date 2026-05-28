@@ -230,13 +230,29 @@ class Trainer:
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
                 text_prompts=text_prompts)
+            # Optional VACE teacher conditioning. We keep this as a pass-through so
+            # existing datasets remain unchanged; only datasets that provide
+            # `vace_context` / `vace_context_scale` will activate this path.
+            if "vace_context" in batch:
+                conditional_dict["vace_context"] = batch["vace_context"].to(
+                    device=self.device, dtype=self.dtype
+                )
+                conditional_dict["vace_context_scale"] = batch.get(
+                    "vace_context_scale",
+                    getattr(self.config, "vace_context_scale", 1.0)
+                )
 
-            if not getattr(self, "unconditional_dict", None):
+            use_cached_uncond = ("vace_context" not in conditional_dict)
+            if (not getattr(self, "unconditional_dict", None)) or (not use_cached_uncond):
                 unconditional_dict = self.model.text_encoder(
                     text_prompts=[self.config.negative_prompt] * batch_size)
                 unconditional_dict = {k: v.detach()
                                       for k, v in unconditional_dict.items()}
-                self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
+                if "vace_context" in conditional_dict:
+                    unconditional_dict["vace_context"] = conditional_dict["vace_context"]
+                    unconditional_dict["vace_context_scale"] = conditional_dict["vace_context_scale"]
+                if use_cached_uncond:
+                    self.unconditional_dict = unconditional_dict  # cache only static unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
 
