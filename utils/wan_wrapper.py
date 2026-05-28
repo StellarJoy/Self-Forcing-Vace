@@ -6,6 +6,7 @@ from torch import nn
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
+from wan.modules.vace_model import VaceWanModel
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
@@ -117,6 +118,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             self,
             model_name="Wan2.1-T2V-1.3B",
             timestep_shift=8.0,
+            use_vace=False,
             is_causal=False,
             local_attn_size=-1,
             sink_size=0
@@ -127,7 +129,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            if use_vace:
+                self.model = VaceWanModel.from_pretrained(f"wan_models/{model_name}/")
+            else:
+                self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep
@@ -228,6 +233,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
+        # Optional VACE-conditioning fields (teacher-side reference guidance).
+        # These keys are intentionally optional to keep old checkpoints/configs fully compatible.
+        vace_context = conditional_dict.get("vace_context", None)
+        vace_context_scale = conditional_dict.get("vace_context_scale", 1.0)
 
         # [B, F] -> [B]
         if self.uniform_timestep:
@@ -235,13 +244,22 @@ class WanDiffusionWrapper(torch.nn.Module):
         else:
             input_timestep = timestep
 
+        common_kwargs = dict(
+            t=input_timestep,
+            context=prompt_embeds,
+            seq_len=self.seq_len
+        )
+        # Only pass VACE args when provided; plain WanModel forward does not require these kwargs.
+        if vace_context is not None:
+            common_kwargs["vace_context"] = vace_context
+            common_kwargs["vace_context_scale"] = vace_context_scale
+
         logits = None
         # X0 prediction
         if kv_cache is not None:
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                t=input_timestep, context=prompt_embeds,
-                seq_len=self.seq_len,
+                **common_kwargs,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
@@ -252,8 +270,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 # teacher forcing
                 flow_pred = self.model(
                     noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                    t=input_timestep, context=prompt_embeds,
-                    seq_len=self.seq_len,
+                    **common_kwargs,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
                 ).permute(0, 2, 1, 3, 4)
@@ -261,8 +278,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 if classify_mode:
                     flow_pred, logits = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
+                        **common_kwargs,
                         classify_mode=True,
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
@@ -273,8 +289,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        **common_kwargs
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
