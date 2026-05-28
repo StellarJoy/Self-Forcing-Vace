@@ -3,6 +3,10 @@ generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
 real_name: Wan2.1-T2V-14B
+# Set to true when teacher uses VACE-style reference conditioning.
+# NOTE: this is a compatibility flag for training pipeline integration.
+use_vace_teacher: false
+vace_context_scale: 1.0
 text_encoder_fsdp_wrap_strategy: size
 denoising_step_list:
 - 1000
