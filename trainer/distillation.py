@@ -15,6 +15,7 @@ import torch
 import wandb
 import time
 import os
+import torch.nn.functional as F
 
 
 class Trainer:
@@ -123,7 +124,13 @@ class Trainer:
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         else:
-            dataset = TextDataset(config.data_path)
+            dataset = TextDataset(
+                config.data_path,
+                gt_video_root=getattr(config, "gt_video_root", None),
+                gt_mask_root=getattr(config, "gt_mask_root", None),
+                gt_video_ext=getattr(config, "gt_video_ext", ".pt"),
+                gt_mask_ext=getattr(config, "gt_mask_ext", ".pt"),
+            )
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
@@ -179,6 +186,55 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
+    def _load_tensor_path(self, path: str, expected_channels: int = None):
+        x = torch.load(path, map_location="cpu")
+        if not isinstance(x, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor from {path}, got {type(x)}")
+        # [T,C,H,W] -> [C,T,H,W]
+        if x.ndim == 4 and x.shape[0] != expected_channels and x.shape[1] == expected_channels:
+            x = x.permute(1, 0, 2, 3).contiguous()
+        return x.float()
+
+    def _align_temporal(self, x: torch.Tensor, target_frames: int):
+        # x: [C,T,H,W]
+        t = x.shape[1]
+        if t == target_frames:
+            return x
+        if t > target_frames:
+            return x[:, :target_frames]
+        pad = x[:, -1:].repeat(1, target_frames - t, 1, 1)
+        return torch.cat([x, pad], dim=1)
+
+    def _build_vace_context(self, batch):
+        if not getattr(self.config, "use_vace_teacher", False):
+            return None
+        if "gt_video_path" not in batch:
+            return None
+
+        vace_list = []
+        target_frames = getattr(self.config, "vace_num_frames", 21)
+        for i, p in enumerate(batch["gt_video_path"]):
+            video = self._load_tensor_path(p, expected_channels=3)  # [C,T,H,W]
+            video = self._align_temporal(video, target_frames).to(device=self.device, dtype=self.dtype)
+
+            if getattr(self.config, "vace_use_mask", True) and "gt_mask_path" in batch:
+                mask = self._load_tensor_path(batch["gt_mask_path"][i], expected_channels=1)
+                if mask.shape[0] != 1:
+                    mask = mask[:1]
+                mask = self._align_temporal(mask, target_frames).to(device=self.device, dtype=self.dtype)
+                inactive = video * (1 - (mask > 0.5).to(video.dtype))
+                reactive = video * (mask > 0.5).to(video.dtype)
+                inactive_latent = self.model.vae.encode_to_latent(inactive.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
+                reactive_latent = self.model.vae.encode_to_latent(reactive.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
+                z = torch.cat([inactive_latent, reactive_latent], dim=0)
+            else:
+                z = self.model.vae.encode_to_latent(video.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
+
+            # zero mask channels for now to match VACE expected in_dim growth behavior minimally
+            m = torch.zeros_like(z)
+            vace_list.append(torch.cat([z, m], dim=0))
+        return vace_list
+
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
@@ -230,6 +286,12 @@ class Trainer:
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
                 text_prompts=text_prompts)
+            vace_context = self._build_vace_context(batch)
+            dropout_prob = getattr(self.config, "reference_dropout_prob", 0.0)
+            use_ref = vace_context is not None and (torch.rand(1, device=self.device).item() >= dropout_prob)
+            if use_ref:
+                conditional_dict["vace_context"] = vace_context
+                conditional_dict["vace_context_scale"] = getattr(self.config, "vace_context_scale", 1.0)
             # Optional VACE teacher conditioning. We keep this as a pass-through so
             # existing datasets remain unchanged; only datasets that provide
             # `vace_context` / `vace_context_scale` will activate this path.

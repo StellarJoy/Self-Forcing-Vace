@@ -7,6 +7,13 @@ real_name: Wan2.1-T2V-14B
 # NOTE: this is a compatibility flag for training pipeline integration.
 use_vace_teacher: false
 vace_context_scale: 1.0
+reference_dropout_prob: 0.0
+vace_use_mask: true
+gt_video_root: null
+gt_mask_root: null
+gt_video_ext: .pt
+gt_mask_ext: .pt
+vace_num_frames: 21
 text_encoder_fsdp_wrap_strategy: size
 denoising_step_list:
 - 1000

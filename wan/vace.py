@@ -8,6 +8,7 @@ from functools import partial
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
@@ -74,9 +75,79 @@ class WanVace:
         self.sample_neg_prompt = config.sample_neg_prompt
         self.sp_size = 1
 
+    def vace_encode_frames(self, frames, ref_images=None, masks=None):
+        if ref_images is None:
+            ref_images = [None] * len(frames)
+        else:
+            assert len(frames) == len(ref_images)
+
+        if masks is None:
+            latents = self.vae.encode(frames)
+        else:
+            masks = [torch.where(m > 0.5, 1.0, 0.0) for m in masks]
+            inactive = [i * (1 - m) + 0 * m for i, m in zip(frames, masks)]
+            reactive = [i * m + 0 * (1 - m) for i, m in zip(frames, masks)]
+            inactive = self.vae.encode(inactive)
+            reactive = self.vae.encode(reactive)
+            latents = [torch.cat((u, c), dim=0) for u, c in zip(inactive, reactive)]
+
+        cat_latents = []
+        for latent, refs in zip(latents, ref_images):
+            if refs is not None:
+                ref_latent = self.vae.encode(refs)
+                if masks is not None:
+                    ref_latent = [torch.cat((u, torch.zeros_like(u)), dim=0) for u in ref_latent]
+                assert all([x.shape[1] == 1 for x in ref_latent])
+                latent = torch.cat([*ref_latent, latent], dim=1)
+            cat_latents.append(latent)
+        return cat_latents
+
+    def vace_encode_masks(self, masks, ref_images=None, vae_stride=None):
+        vae_stride = self.vae_stride if vae_stride is None else vae_stride
+        if ref_images is None:
+            ref_images = [None] * len(masks)
+        else:
+            assert len(masks) == len(ref_images)
+
+        result_masks = []
+        for mask, refs in zip(masks, ref_images):
+            _, depth, height, width = mask.shape
+            new_depth = int((depth + 3) // vae_stride[0])
+            height = 2 * (int(height) // (vae_stride[1] * 2))
+            width = 2 * (int(width) // (vae_stride[2] * 2))
+
+            mask = mask[0, :, :, :]
+            mask = mask.view(depth, height, vae_stride[1], width, vae_stride[1])
+            mask = mask.permute(2, 4, 0, 1, 3)
+            mask = mask.reshape(vae_stride[1] * vae_stride[2], depth, height, width)
+
+            mask = F.interpolate(mask.unsqueeze(0), size=(new_depth, height, width), mode='nearest-exact').squeeze(0)
+
+            if refs is not None:
+                length = len(refs)
+                mask_pad = torch.zeros_like(mask[:, :length, :, :])
+                mask = torch.cat((mask_pad, mask), dim=1)
+            result_masks.append(mask)
+        return result_masks
+
+    def vace_latent(self, z, m):
+        return [torch.cat([zz, mm], dim=0) for zz, mm in zip(z, m)]
+
+    def build_vace_context(self, input_frames, input_masks=None, input_ref_images=None):
+        if input_frames is None:
+            return None
+        if input_masks is None:
+            input_masks = [torch.ones_like(v)[:1] for v in input_frames]
+        z0 = self.vace_encode_frames(input_frames, input_ref_images, masks=input_masks)
+        m0 = self.vace_encode_masks(input_masks, input_ref_images)
+        return self.vace_latent(z0, m0)
+
     def generate(
         self,
         input_prompt,
+        input_frames=None,
+        input_masks=None,
+        input_ref_images=None,
         vace_context=None,
         vace_context_scale=1.0,
         size=(1280, 720),
@@ -107,6 +178,8 @@ class WanVace:
         seed_g.manual_seed(seed)
         context = self.text_encoder([input_prompt], self.device)
         context_null = self.text_encoder([n_prompt], self.device)
+        if vace_context is None:
+            vace_context = self.build_vace_context(input_frames, input_masks, input_ref_images)
         latents = [
             torch.randn(
                 *target_shape, dtype=torch.float32, device=self.device, generator=seed_g
