@@ -205,6 +205,24 @@ class Trainer:
         pad = x[:, -1:].repeat(1, target_frames - t, 1, 1)
         return torch.cat([x, pad], dim=1)
 
+    def _encode_vace_mask(self, mask: torch.Tensor, vae_stride=(4, 8, 8)):
+        # Mirrors WanVace.vace_encode_masks for the common no-ref-image case.
+        # mask: [1,T,H,W] in pixel space -> [stride_h*stride_w,Tz,H/stride_h,W/stride_w]
+        _, depth, height, width = mask.shape
+        latent_depth = int((depth + 3) // vae_stride[0])
+        latent_height = 2 * (int(height) // (vae_stride[1] * 2))
+        latent_width = 2 * (int(width) // (vae_stride[2] * 2))
+
+        mask = mask[0, :, :latent_height * vae_stride[1], :latent_width * vae_stride[2]].contiguous()
+        mask = mask.view(depth, latent_height, vae_stride[1], latent_width, vae_stride[2])
+        mask = mask.permute(2, 4, 0, 1, 3)
+        mask = mask.reshape(vae_stride[1] * vae_stride[2], depth, latent_height, latent_width)
+        return F.interpolate(
+            mask.unsqueeze(0),
+            size=(latent_depth, latent_height, latent_width),
+            mode="nearest-exact"
+        ).squeeze(0)
+
     def _build_vace_context(self, batch):
         if not getattr(self.config, "use_vace_teacher", False):
             return None
@@ -217,21 +235,31 @@ class Trainer:
             video = self._load_tensor_path(p, expected_channels=3)  # [C,T,H,W]
             video = self._align_temporal(video, target_frames).to(device=self.device, dtype=self.dtype)
 
-            if getattr(self.config, "vace_use_mask", True) and "gt_mask_path" in batch:
-                mask = self._load_tensor_path(batch["gt_mask_path"][i], expected_channels=1)
-                if mask.shape[0] != 1:
-                    mask = mask[:1]
-                mask = self._align_temporal(mask, target_frames).to(device=self.device, dtype=self.dtype)
-                inactive = video * (1 - (mask > 0.5).to(video.dtype))
-                reactive = video * (mask > 0.5).to(video.dtype)
+            if getattr(self.config, "vace_use_mask", True):
+                if "gt_mask_path" in batch:
+                    mask = self._load_tensor_path(batch["gt_mask_path"][i], expected_channels=1)
+                    if mask.shape[0] != 1:
+                        mask = mask[:1]
+                    mask = self._align_temporal(mask, target_frames).to(device=self.device, dtype=self.dtype)
+                    mask = (mask > 0.5).to(video.dtype)
+                else:
+                    # Native WanVace does this when only input_frames are provided: no mask
+                    # means the whole video is the reference/conditioned region.
+                    mask = torch.ones_like(video[:1])
+
+                inactive = video * (1 - mask)
+                reactive = video * mask
                 inactive_latent = self.model.vae.encode_to_latent(inactive.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
                 reactive_latent = self.model.vae.encode_to_latent(reactive.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
                 z = torch.cat([inactive_latent, reactive_latent], dim=0)
+                m = self._encode_vace_mask(
+                    mask,
+                    vae_stride=tuple(getattr(self.config, "vace_vae_stride", (4, 8, 8)))
+                )
             else:
                 z = self.model.vae.encode_to_latent(video.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
+                m = torch.zeros_like(z)
 
-            # zero mask channels for now to match VACE expected in_dim growth behavior minimally
-            m = torch.zeros_like(z)
             vace_list.append(torch.cat([z, m], dim=0))
         return vace_list
 
