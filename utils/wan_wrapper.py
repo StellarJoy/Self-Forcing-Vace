@@ -125,6 +125,7 @@ class WanDiffusionWrapper(torch.nn.Module):
     ):
         super().__init__()
 
+        self.use_vace = use_vace and not is_causal
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
@@ -249,8 +250,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             context=prompt_embeds,
             seq_len=self.seq_len
         )
-        # Only pass VACE args when provided; plain WanModel forward does not require these kwargs.
-        if vace_context is not None:
+        # Only the VACE teacher accepts VACE kwargs. The causal generator and
+        # plain fake-score WanModel must ignore reference context carried in the
+        # shared conditional_dict.
+        if self.use_vace and vace_context is not None:
             common_kwargs["vace_context"] = vace_context
             common_kwargs["vace_context_scale"] = vace_context_scale
 

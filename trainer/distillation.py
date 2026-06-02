@@ -2,7 +2,7 @@ import gc
 import logging
 
 from utils.dataset import ShardingLMDBDataset, cycle
-from utils.dataset import TextDataset
+from utils.dataset import TextDataset, ShardedLatentEmbedDataset
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -121,7 +121,16 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        if self.config.i2v:
+        data_format = getattr(config, "data_format", "text")
+        if data_format == "sharded_latent_embed":
+            dataset = ShardedLatentEmbedDataset(
+                config.data_path,
+                latent_filename=getattr(config, "latent_filename", "latent.pt"),
+                embed_filename=getattr(config, "embed_filename", "embed.pt"),
+                prompt_filename=getattr(config, "prompt_filename", "prompt.txt"),
+                max_samples=getattr(config, "max_samples", None),
+            )
+        elif self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         else:
             dataset = TextDataset(
@@ -205,9 +214,70 @@ class Trainer:
         pad = x[:, -1:].repeat(1, target_frames - t, 1, 1)
         return torch.cat([x, pad], dim=1)
 
+    def _encode_vace_mask(self, mask: torch.Tensor, vae_stride=(4, 8, 8)):
+        # Mirrors WanVace.vace_encode_masks for the common no-ref-image case.
+        # mask: [1,T,H,W] in pixel space -> [stride_h*stride_w,Tz,H/stride_h,W/stride_w]
+        _, depth, height, width = mask.shape
+        latent_depth = int((depth + 3) // vae_stride[0])
+        latent_height = 2 * (int(height) // (vae_stride[1] * 2))
+        latent_width = 2 * (int(width) // (vae_stride[2] * 2))
+
+        mask = mask[0, :, :latent_height * vae_stride[1], :latent_width * vae_stride[2]].contiguous()
+        mask = mask.view(depth, latent_height, vae_stride[1], latent_width, vae_stride[2])
+        mask = mask.permute(2, 4, 0, 1, 3)
+        mask = mask.reshape(vae_stride[1] * vae_stride[2], depth, latent_height, latent_width)
+        return F.interpolate(
+            mask.unsqueeze(0),
+            size=(latent_depth, latent_height, latent_width),
+            mode="nearest-exact"
+        ).squeeze(0)
+
+    def _normalize_prompt_embeds(self, prompt_embeds: torch.Tensor):
+        if prompt_embeds.ndim == 4 and prompt_embeds.shape[1] == 1:
+            prompt_embeds = prompt_embeds.squeeze(1)
+        return prompt_embeds.to(device=self.device, dtype=self.dtype)
+
+    @staticmethod
+    def _normalize_vace_latent(latent: torch.Tensor):
+        if latent.ndim == 5 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        if latent.ndim != 4:
+            raise ValueError(f"Expected VACE latent with shape [C,T,H,W] or [T,C,H,W], got {tuple(latent.shape)}")
+        if latent.shape[0] != 16 and latent.shape[1] == 16:
+            latent = latent.permute(1, 0, 2, 3).contiguous()
+        if latent.shape[0] != 16:
+            raise ValueError(f"Expected VACE latent channel dimension 16, got shape {tuple(latent.shape)}")
+        return latent
+
+    @staticmethod
+    def _build_full_reference_vace_context_from_latent(latent: torch.Tensor):
+        inactive_latent = torch.zeros_like(latent)
+        reactive_latent = latent
+        mask_latent = torch.ones(
+            64,
+            latent.shape[1],
+            latent.shape[2],
+            latent.shape[3],
+            device=latent.device,
+            dtype=latent.dtype,
+        )
+        return torch.cat([inactive_latent, reactive_latent, mask_latent], dim=0)
+
     def _build_vace_context(self, batch):
         if not getattr(self.config, "use_vace_teacher", False):
             return None
+
+        if "vace_latent" in batch:
+            latent_batch = batch["vace_latent"].to(device=self.device, dtype=self.dtype)
+            if latent_batch.ndim == 4:
+                latent_batch = latent_batch.unsqueeze(0)
+            return [
+                self._build_full_reference_vace_context_from_latent(
+                    self._normalize_vace_latent(latent)
+                )
+                for latent in latent_batch
+            ]
+
         if "gt_video_path" not in batch:
             return None
 
@@ -217,21 +287,31 @@ class Trainer:
             video = self._load_tensor_path(p, expected_channels=3)  # [C,T,H,W]
             video = self._align_temporal(video, target_frames).to(device=self.device, dtype=self.dtype)
 
-            if getattr(self.config, "vace_use_mask", True) and "gt_mask_path" in batch:
-                mask = self._load_tensor_path(batch["gt_mask_path"][i], expected_channels=1)
-                if mask.shape[0] != 1:
-                    mask = mask[:1]
-                mask = self._align_temporal(mask, target_frames).to(device=self.device, dtype=self.dtype)
-                inactive = video * (1 - (mask > 0.5).to(video.dtype))
-                reactive = video * (mask > 0.5).to(video.dtype)
+            if getattr(self.config, "vace_use_mask", True):
+                if "gt_mask_path" in batch:
+                    mask = self._load_tensor_path(batch["gt_mask_path"][i], expected_channels=1)
+                    if mask.shape[0] != 1:
+                        mask = mask[:1]
+                    mask = self._align_temporal(mask, target_frames).to(device=self.device, dtype=self.dtype)
+                    mask = (mask > 0.5).to(video.dtype)
+                else:
+                    # Native WanVace does this when only input_frames are provided: no mask
+                    # means the whole video is the reference/conditioned region.
+                    mask = torch.ones_like(video[:1])
+
+                inactive = video * (1 - mask)
+                reactive = video * mask
                 inactive_latent = self.model.vae.encode_to_latent(inactive.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
                 reactive_latent = self.model.vae.encode_to_latent(reactive.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
                 z = torch.cat([inactive_latent, reactive_latent], dim=0)
+                m = self._encode_vace_mask(
+                    mask,
+                    vae_stride=tuple(getattr(self.config, "vace_vae_stride", (4, 8, 8)))
+                )
             else:
                 z = self.model.vae.encode_to_latent(video.unsqueeze(0)).squeeze(0).permute(1, 0, 2, 3)
+                m = torch.zeros_like(z)
 
-            # zero mask channels for now to match VACE expected in_dim growth behavior minimally
-            m = torch.zeros_like(z)
             vace_list.append(torch.cat([z, m], dim=0))
         return vace_list
 
@@ -268,8 +348,8 @@ class Trainer:
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
 
-        # Step 1: Get the next batch of text prompts
-        text_prompts = batch["prompts"]
+        # Step 1: Get the next batch of prompts or precomputed prompt embeddings
+        text_prompts = batch.get("prompts", None)
         if self.config.i2v:
             clean_latent = None
             image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
@@ -278,14 +358,22 @@ class Trainer:
             clean_latent = None
             image_latent = None
 
-        batch_size = len(text_prompts)
+        if "prompt_embeds" in batch:
+            batch_size = batch["prompt_embeds"].shape[0]
+        else:
+            batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
         image_or_video_shape[0] = batch_size
 
         # Step 2: Extract the conditional infos
         with torch.no_grad():
-            conditional_dict = self.model.text_encoder(
-                text_prompts=text_prompts)
+            if "prompt_embeds" in batch:
+                conditional_dict = {
+                    "prompt_embeds": self._normalize_prompt_embeds(batch["prompt_embeds"])
+                }
+            else:
+                conditional_dict = self.model.text_encoder(
+                    text_prompts=text_prompts)
             vace_context = self._build_vace_context(batch)
             dropout_prob = getattr(self.config, "reference_dropout_prob", 0.0)
             use_ref = vace_context is not None and (torch.rand(1, device=self.device).item() >= dropout_prob)
