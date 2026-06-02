@@ -40,6 +40,13 @@ beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 data_path: prompts/vidprom_filtered_extended.txt
+# Use "text" for prompt txt training, or "sharded_latent_embed" for
+# shard.*/sample_id/{prompt.txt,embed.pt,latent.pt} reference-latent training.
+data_format: text
+latent_filename: latent.pt
+embed_filename: embed.pt
+prompt_filename: prompt.txt
+max_samples: null
 batch_size: 1
 ema_weight: 0.99
 ema_start_step: 200

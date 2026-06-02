@@ -50,6 +50,68 @@ class TextDataset(Dataset):
         return batch
 
 
+class ShardedLatentEmbedDataset(Dataset):
+    def __init__(
+        self,
+        data_root,
+        latent_filename="latent.pt",
+        embed_filename="embed.pt",
+        prompt_filename="prompt.txt",
+        max_samples=None,
+    ):
+        self.data_root = Path(data_root)
+        self.latent_filename = latent_filename
+        self.embed_filename = embed_filename
+        self.prompt_filename = prompt_filename
+
+        self.samples = []
+        for latent_path in sorted(self.data_root.rglob(self.latent_filename)):
+            sample_dir = latent_path.parent
+            embed_path = sample_dir / self.embed_filename
+            prompt_path = sample_dir / self.prompt_filename
+            if embed_path.exists():
+                self.samples.append({
+                    "latent_path": latent_path,
+                    "embed_path": embed_path,
+                    "prompt_path": prompt_path if prompt_path.exists() else None,
+                })
+
+        if max_samples is not None and max_samples > 0:
+            self.samples = self.samples[:max_samples]
+        if len(self.samples) == 0:
+            raise ValueError(
+                f"No samples with {self.latent_filename} and {self.embed_filename} found under {self.data_root}"
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _load_tensor(path: Path):
+        tensor = torch.load(path, map_location="cpu")
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor from {path}, got {type(tensor)}")
+        if tensor.ndim > 0 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        return tensor.float()
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        if sample["prompt_path"] is not None:
+            with open(sample["prompt_path"], encoding="utf-8") as f:
+                prompt = f.read().strip()
+        else:
+            prompt = ""
+
+        return {
+            "prompts": prompt,
+            "prompt_embeds": self._load_tensor(sample["embed_path"]),
+            "vace_latent": self._load_tensor(sample["latent_path"]),
+            "sample_path": str(sample["latent_path"].parent),
+            "idx": idx,
+        }
+
+
 class ODERegressionLMDBDataset(Dataset):
     def __init__(self, data_path: str, max_pair: int = int(1e8)):
         self.env = lmdb.open(data_path, readonly=True,
