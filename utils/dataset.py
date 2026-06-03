@@ -67,13 +67,15 @@ class ShardedLatentEmbedDataset(Dataset):
         self.samples = []
         for latent_path in sorted(self.data_root.rglob(self.latent_filename)):
             sample_dir = latent_path.parent
-            embed_path = sample_dir / self.embed_filename
-            prompt_path = sample_dir / self.prompt_filename
-            if embed_path.exists():
+            embed_path = self._resolve_paired_path(
+                sample_dir, self.embed_filename, latent_path, required=True)
+            prompt_path = self._resolve_paired_path(
+                sample_dir, self.prompt_filename, latent_path, required=False)
+            if embed_path is not None:
                 self.samples.append({
                     "latent_path": latent_path,
                     "embed_path": embed_path,
-                    "prompt_path": prompt_path if prompt_path.exists() else None,
+                    "prompt_path": prompt_path,
                 })
 
         if max_samples is not None and max_samples > 0:
@@ -82,6 +84,49 @@ class ShardedLatentEmbedDataset(Dataset):
             raise ValueError(
                 f"No samples with {self.latent_filename} and {self.embed_filename} found under {self.data_root}"
             )
+
+    @staticmethod
+    def _has_glob_pattern(filename: str):
+        return any(char in filename for char in "*?[")
+
+    @staticmethod
+    def _single_star_suffix(filename: str):
+        if (
+            filename.count("*") == 1
+            and filename.startswith("*")
+            and not any(char in filename for char in "?[")
+        ):
+            return filename[1:]
+        return None
+
+    def _resolve_paired_path(
+        self, sample_dir: Path, filename: str, latent_path: Path, required: bool
+    ):
+        if not self._has_glob_pattern(filename):
+            path = sample_dir / filename
+            return path if path.exists() else None
+
+        target_suffix = self._single_star_suffix(filename)
+        latent_suffix = self._single_star_suffix(self.latent_filename)
+        if (
+            target_suffix is not None
+            and latent_suffix is not None
+            and latent_path.name.endswith(latent_suffix)
+        ):
+            prefix = latent_path.name[:-len(latent_suffix)]
+            path = sample_dir / f"{prefix}{target_suffix}"
+            if path.exists():
+                return path
+
+        matches = sorted(sample_dir.glob(filename))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1 and required:
+            raise ValueError(
+                f"Multiple files matching {filename} found next to {latent_path}; "
+                "use a prefix-preserving pattern such as '*.embed.pt' or rename files."
+            )
+        return None
 
     def __len__(self):
         return len(self.samples)

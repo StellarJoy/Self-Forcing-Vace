@@ -38,6 +38,16 @@ reference_root/
 
 `embed.pt` should be the Wan text embedding for the prompt. Training uses it directly as `prompt_embeds`, so the T5 text encoder does not need to recompute the conditional prompt embedding for these samples. `prompt.txt` is still useful metadata for debugging, logging, and evaluation.
 
+If each sample stores files with the sample id as a prefix, for example `000000000.latent.pt`, `000000000.embed.pt`, and `000000000.prompt.txt`, configure the filenames as glob patterns:
+
+```yaml
+latent_filename: "*.latent.pt"
+embed_filename: "*.embed.pt"
+prompt_filename: "*.prompt.txt"
+```
+
+The dataset pairs files in the same sample directory and prefers the matching prefix before falling back to a single glob match.
+
 `latent.pt` should be a Wan VAE latent for the reference video, either `[16,T,H,W]` or `[T,16,H,W]`. The trainer treats this as a full-video VACE reference by building:
 
 ```text
