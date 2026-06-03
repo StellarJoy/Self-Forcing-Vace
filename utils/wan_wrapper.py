@@ -199,6 +199,23 @@ class WanDiffusionWrapper(torch.nn.Module):
         return x0_pred.to(original_dtype)
 
     @staticmethod
+    def _stack_model_output(output):
+        """Normalize WAN module outputs to a batched tensor.
+
+        The upstream WanModel/CausalWanModel return a tensor with shape
+        [B, C, F, H, W], while VaceWanModel returns a Python list of per-sample
+        tensors with shape [C, F, H, W].  The wrapper operates on batched
+        tensors, so convert list outputs before the common layout conversion.
+        """
+        if isinstance(output, torch.Tensor):
+            return output
+        if isinstance(output, (list, tuple)):
+            if not output:
+                raise ValueError("WAN model returned an empty output list")
+            return torch.stack(output, dim=0)
+        raise TypeError(f"Unsupported WAN model output type: {type(output)!r}")
+
+    @staticmethod
     def _convert_x0_to_flow_pred(scheduler, x0_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """
         Convert x0 prediction to flow matching's prediction.
@@ -267,7 +284,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
                 cache_start=cache_start
-            ).permute(0, 2, 1, 3, 4)
+            )
+            flow_pred = self._stack_model_output(flow_pred).permute(
+                0, 2, 1, 3, 4
+            )
         else:
             if clean_x is not None:
                 # teacher forcing
@@ -276,7 +296,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                     **common_kwargs,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
-                ).permute(0, 2, 1, 3, 4)
+                )
+                flow_pred = self._stack_model_output(flow_pred).permute(
+                    0, 2, 1, 3, 4
+                )
             else:
                 if classify_mode:
                     flow_pred, logits = self.model(
@@ -293,7 +316,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         **common_kwargs
-                    ).permute(0, 2, 1, 3, 4)
+                    )
+                    flow_pred = self._stack_model_output(flow_pred).permute(
+                        0, 2, 1, 3, 4
+                    )
 
         pred_x0 = self._convert_flow_pred_to_x0(
             flow_pred=flow_pred.flatten(0, 1),
