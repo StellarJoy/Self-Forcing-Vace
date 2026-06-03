@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
 
@@ -173,11 +172,13 @@ class VaceWanModel(WanModel):
                       dim=1) for u in x
         ])
 
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        # Keep time embeddings in the same dtype as the patched hidden states.
+        # FSDP mixed precision casts module weights to bf16 during forward, so
+        # leaving e/e0 in fp32 promotes the VACE hidden states back to fp32 in
+        # WanAttentionBlock modulation and later bf16 Linear layers fail.
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).type_as(x))
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
         context_lens = None
         context = self.text_embedding(
