@@ -5,4 +5,4 @@ wan_models
 checkpoints
 logs
 data
-prompts/vbench/vidprom_filtered_extended.txt
+prompts/vidprom_filtered_extended.txt
